@@ -54,9 +54,17 @@ extern "C" {
 #else
 #define IP4ADDR_SOCKADDR_SET_LEN(addr)
 #define IP6ADDR_SOCKADDR_SET_LEN(addr)
+#if LWIP_IPV4 && LWIP_IPV6
 #define IPADDR_SOCKADDR_GET_LEN(addr) \
       ((addr)->sa.sa_family == AF_INET ? sizeof(struct sockaddr_in) \
         : ((addr)->sa.sa_family == AF_INET6 ? sizeof(struct sockaddr_in6) : 0))
+#elif LWIP_IPV4
+#define IPADDR_SOCKADDR_GET_LEN(addr) sizeof(struct sockaddr_in)
+#elif LWIP_IPV6
+#define IPADDR_SOCKADDR_GET_LEN(addr) sizeof(struct sockaddr_in6)
+#else
+#define IPADDR_SOCKADDR_GET_LEN(addr) sizeof(struct sockaddr)
+#endif /* LWIP_IPV4 && LWIP_IPV6 */
 #endif /* HAVE_SA_LEN */
 
 #define SIN_ZERO_LEN	sizeof (struct sockaddr) - \
