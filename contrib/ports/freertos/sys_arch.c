@@ -82,9 +82,6 @@
 #define LWIP_FREERTOS_SYS_NOW_FROM_FREERTOS           1
 #endif
 
-#if !configSUPPORT_DYNAMIC_ALLOCATION
-# error "lwIP FreeRTOS port requires configSUPPORT_DYNAMIC_ALLOCATION"
-#endif
 #if !INCLUDE_vTaskDelay
 # error "lwIP FreeRTOS port requires INCLUDE_vTaskDelay"
 #endif
@@ -195,17 +192,71 @@ sys_arch_msleep(u32_t delay_ms)
 
 #if !LWIP_COMPAT_MUTEX
 
+#if configSUPPORT_STATIC_ALLOCATION
+
+#ifndef LWIP_MAX_MUTEXES
+#define LWIP_MAX_MUTEXES 4
+#endif
+
+typedef struct {
+  StaticSemaphore_t buffer; // actual static mutex memory
+  void *handle;             // store pointer handle for lookup
+} mutex_slot_t;
+
+static mutex_slot_t mutex_slots[LWIP_MAX_MUTEXES];
+
+// Allocate a free static mutex slot
+static int alloc_mutex_index(void **out_handle)
+{
+  int result = -1;
+  taskENTER_CRITICAL();
+  for(int i = 0; i < LWIP_MAX_MUTEXES && result == -1; i++){
+    if(mutex_slots[i].handle == NULL) {   // free if handle is NULL
+      *out_handle = (void *)&mutex_slots[i].buffer;
+      mutex_slots[i].handle = *out_handle;
+      result = i;
+    }
+  }
+  taskEXIT_CRITICAL();
+  return result;
+}
+
+// Free a static mutex slot
+static void free_mutex(void *handle)
+{
+  taskENTER_CRITICAL();
+  for(int i = 0; i < LWIP_MAX_MUTEXES; i++){
+    if(mutex_slots[i].handle == handle){
+      mutex_slots[i].handle = NULL;     // mark as free
+      break;
+    }
+  }
+  taskEXIT_CRITICAL();
+}
+#endif
+
 /* Create a new mutex*/
 err_t
 sys_mutex_new(sys_mutex_t *mutex)
 {
   LWIP_ASSERT("mutex != NULL", mutex != NULL);
 
+#if configSUPPORT_STATIC_ALLOCATION
+  int idx = alloc_mutex_index((void **)&mutex->mut);
+  if(idx < 0) {
+    SYS_STATS_INC(mutex.err);
+    return ERR_MEM;
+  }
+
+  mutex->mut = xSemaphoreCreateRecursiveMutexStatic(&mutex_slots[idx].buffer);
+  LWIP_ASSERT("sys_mutex_new creation failed", mutex->mut != NULL);
+#else
   mutex->mut = xSemaphoreCreateRecursiveMutex();
   if(mutex->mut == NULL) {
     SYS_STATS_INC(mutex.err);
     return ERR_MEM;
   }
+#endif
   SYS_STATS_INC_USED(mutex);
   return ERR_OK;
 }
@@ -239,11 +290,61 @@ sys_mutex_free(sys_mutex_t *mutex)
   LWIP_ASSERT("mutex->mut != NULL", mutex->mut != NULL);
 
   SYS_STATS_DEC(mutex.used);
+#if configSUPPORT_STATIC_ALLOCATION
+  free_mutex(mutex->mut);
+  // Do NOT call vSemaphoreDelete on static mutex
+  mutex->mut = NULL;
+#else
   vSemaphoreDelete(mutex->mut);
   mutex->mut = NULL;
+#endif
 }
 
 #endif /* !LWIP_COMPAT_MUTEX */
+
+#if configSUPPORT_STATIC_ALLOCATION
+
+#ifndef LWIP_MAX_SEMAPHORES
+#define LWIP_MAX_SEMAPHORES 4
+#endif
+
+typedef struct {
+  StaticSemaphore_t buffer; // actual static semaphore memory
+  void *handle;             // pointer to track allocation
+} sem_slot_t;
+
+static sem_slot_t sem_slots[LWIP_MAX_SEMAPHORES];
+
+// --- Allocate a free static semaphore slot ---
+static int alloc_sem_index(void **out_handle)
+{
+  int result = -1;
+  taskENTER_CRITICAL();
+  for(int i = 0; i < LWIP_MAX_SEMAPHORES && result == -1; i++){
+    if(sem_slots[i].handle == NULL){       // slot is free
+      *out_handle = (void *)&sem_slots[i].buffer;
+      sem_slots[i].handle = *out_handle;   // mark allocated
+      result = i;
+    }
+  }
+  taskEXIT_CRITICAL();
+  return result;
+}
+
+// --- Free a static semaphore slot ---
+static void free_sem(void *handle)
+{
+  taskENTER_CRITICAL();
+  for(int i = 0; i < LWIP_MAX_SEMAPHORES; i++){
+    if(sem_slots[i].handle == handle){
+      sem_slots[i].handle = NULL;          // mark slot free
+      break;
+    }
+  }
+  taskEXIT_CRITICAL();
+}
+
+#endif
 
 err_t
 sys_sem_new(sys_sem_t *sem, u8_t initial_count)
@@ -252,11 +353,22 @@ sys_sem_new(sys_sem_t *sem, u8_t initial_count)
   LWIP_ASSERT("initial_count invalid (not 0 or 1)",
     (initial_count == 0) || (initial_count == 1));
 
+#if configSUPPORT_STATIC_ALLOCATION
+  int idx = alloc_sem_index((void **)&sem->sem);
+  if(idx < 0){
+    SYS_STATS_INC(sem.err);
+    return ERR_MEM; // no free slot
+  }
+
+  sem->sem = xSemaphoreCreateBinaryStatic(&sem_slots[idx].buffer);
+  LWIP_ASSERT("sys_sem_new: creation failed", sem->sem != NULL);
+#else
   sem->sem = xSemaphoreCreateBinary();
   if(sem->sem == NULL) {
     SYS_STATS_INC(sem.err);
     return ERR_MEM;
   }
+#endif
   SYS_STATS_INC_USED(sem);
 
   if(initial_count == 1) {
@@ -313,9 +425,66 @@ sys_sem_free(sys_sem_t *sem)
   LWIP_ASSERT("sem->sem != NULL", sem->sem != NULL);
 
   SYS_STATS_DEC(sem.used);
+#if configSUPPORT_STATIC_ALLOCATION
+  free_sem(sem->sem);
+#else
   vSemaphoreDelete(sem->sem);
+#endif
   sem->sem = NULL;
 }
+
+#if configSUPPORT_STATIC_ALLOCATION
+
+#ifndef LWIP_MBOX_MAX
+#define LWIP_MBOX_MAX      8    // max number of static mailboxes
+#endif
+#ifndef LWIP_MBOX_SIZE_MAX
+#define LWIP_MBOX_SIZE_MAX 16   // max size of each mailbox
+#endif
+
+typedef struct {
+  StaticQueue_t tcb;                 // queue TCB
+  uint8_t buffer[sizeof(void *) * LWIP_MBOX_SIZE_MAX]; // storage
+  void *handle;                      // pointer handle for allocation tracking
+} mbox_slot_t;
+
+static mbox_slot_t mbox_slots[LWIP_MBOX_MAX];
+
+// --- Allocate a free static mailbox slot ---
+static int alloc_mbox_index(void **out_handle, int size)
+{
+  int result = -1;
+
+  if (size > LWIP_MBOX_SIZE_MAX) {
+    return -1;
+  }
+
+  taskENTER_CRITICAL();
+  for(int i = 0; i < LWIP_MBOX_MAX && result == -1; i++){
+    if(mbox_slots[i].handle == NULL){ // free slot
+      *out_handle = (void *)&mbox_slots[i].tcb; // temporary key
+      mbox_slots[i].handle = *out_handle;
+      result = i;
+    }
+  }
+  taskEXIT_CRITICAL();
+  return result;
+}
+
+// --- Free a static mailbox slot ---
+static void free_mbox(void *handle)
+{
+  taskENTER_CRITICAL();
+  for(int i = 0; i < LWIP_MBOX_MAX; i++){
+    if(mbox_slots[i].handle == handle){
+      mbox_slots[i].handle = NULL; // mark slot free
+      break;
+    }
+  }
+  taskEXIT_CRITICAL();
+}
+
+#endif
 
 err_t
 sys_mbox_new(sys_mbox_t *mbox, int size)
@@ -323,11 +492,27 @@ sys_mbox_new(sys_mbox_t *mbox, int size)
   LWIP_ASSERT("mbox != NULL", mbox != NULL);
   LWIP_ASSERT("size > 0", size > 0);
 
+#if configSUPPORT_STATIC_ALLOCATION
+  int idx = alloc_mbox_index((void **)&mbox->mbx, size);
+  if(idx < 0){
+    SYS_STATS_INC(mbox.err);
+    return ERR_MEM;
+  }
+
+  mbox->mbx = xQueueCreateStatic(
+    (UBaseType_t)size,                    // Number of items
+    sizeof(void *),                        // Item size
+    mbox_slots[idx].buffer,               // Storage buffer
+    &mbox_slots[idx].tcb                  // TCB buffer
+  );
+  LWIP_ASSERT("sys_mbox_new creation failed", mbox->mbx != NULL);
+#else
   mbox->mbx = xQueueCreate((UBaseType_t)size, sizeof(void *));
   if(mbox->mbx == NULL) {
     SYS_STATS_INC(mbox.err);
     return ERR_MEM;
   }
+#endif
   SYS_STATS_INC_USED(mbox);
   return ERR_OK;
 }
@@ -445,7 +630,7 @@ sys_mbox_free(sys_mbox_t *mbox)
 #if LWIP_FREERTOS_CHECK_QUEUE_EMPTY_ON_FREE
   {
     UBaseType_t msgs_waiting = uxQueueMessagesWaiting(mbox->mbx);
-    LWIP_ASSERT("mbox quence not empty", msgs_waiting == 0);
+    LWIP_ASSERT("mbox queue not empty", msgs_waiting == 0);
 
     if (msgs_waiting != 0) {
       SYS_STATS_INC(mbox.err);
@@ -453,10 +638,30 @@ sys_mbox_free(sys_mbox_t *mbox)
   }
 #endif
 
+#if configSUPPORT_STATIC_ALLOCATION
+  free_mbox(mbox->mbx);
+  mbox->mbx = NULL;
+#else
   vQueueDelete(mbox->mbx);
+#endif
 
   SYS_STATS_DEC(mbox.used);
 }
+
+#if configSUPPORT_STATIC_ALLOCATION
+
+#ifndef MAX_STATIC_THREADS
+#define MAX_STATIC_THREADS 4
+#endif
+#ifndef MAX_THREAD_STACKSIZE
+#define MAX_THREAD_STACKSIZE 512
+#endif
+
+static StackType_t static_task_stacks[MAX_STATIC_THREADS][MAX_THREAD_STACKSIZE];
+static StaticTask_t static_task_tcbs[MAX_STATIC_THREADS];
+static int static_task_count = 0;
+
+#endif
 
 sys_thread_t
 sys_thread_new(const char *name, lwip_thread_fn thread, void *arg, int stacksize, int prio)
@@ -475,8 +680,37 @@ sys_thread_new(const char *name, lwip_thread_fn thread, void *arg, int stacksize
 
   /* lwIP's lwip_thread_fn matches FreeRTOS' TaskFunction_t, so we can pass the
      thread function without adaption here. */
+#if configSUPPORT_STATIC_ALLOCATION
+  taskENTER_CRITICAL();
+  if (static_task_count >= MAX_STATIC_THREADS) {
+    taskEXIT_CRITICAL();
+    LWIP_ASSERT("too many static threads", 0);
+    lwip_thread.thread_handle = NULL;
+    return lwip_thread;
+  }
+  int my_slot = static_task_count++;
+  taskEXIT_CRITICAL();
+
+  LWIP_ASSERT("stacksize too large", rtos_stacksize <= MAX_THREAD_STACKSIZE);
+
+  StackType_t *stack_buffer = static_task_stacks[my_slot];
+  StaticTask_t *tcb_buffer = &static_task_tcbs[my_slot];
+
+  rtos_task = xTaskCreateStatic(
+    thread,             // Task function
+    name,               // Task name
+    rtos_stacksize,     // Stack depth
+    arg,                // Parameters
+    prio,               // Priority
+    stack_buffer,       // Stack buffer
+    tcb_buffer          // TCB buffer
+  );
+
+  LWIP_ASSERT("sys_thread_new creation failed", rtos_task != NULL);
+#else
   ret = xTaskCreate(thread, name, (configSTACK_DEPTH_TYPE)rtos_stacksize, arg, prio, &rtos_task);
   LWIP_ASSERT("task creation failed", ret == pdTRUE);
+#endif
 
   lwip_thread.thread_handle = rtos_task;
   return lwip_thread;
