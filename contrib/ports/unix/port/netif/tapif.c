@@ -30,6 +30,7 @@
  *
  */
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -423,7 +424,16 @@ tapif_thread(void *arg)
     if(ret == 1) {
       /* Handle incoming packet. */
       tapif_input(netif);
-    } else if(ret == -1) {
+      /*
+       * FreeRTOS Posix port: select is on a fd of a file (/dev/...), not a socket.
+       * So cannot use lwIP select function (lwip_select) but the GCC select function.
+       * lwIP has not open function, so mixing GCC open function and lwIP select function
+       * will result in bad fd (?) from lwIP select function.
+       * FreeRTOS scheduler will cause EINTR so we have to restart the system call.
+       * 
+       * TODO: need to verify the behavior.
+       */
+    } else if(ret == -1 && errno != EINTR) {
       perror("tapif_thread: select");
     }
   }
